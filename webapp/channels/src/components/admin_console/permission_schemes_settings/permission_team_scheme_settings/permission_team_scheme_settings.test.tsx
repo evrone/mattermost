@@ -4,7 +4,9 @@
 import {shallow} from 'enzyme';
 import React from 'react';
 
-import PermissionTeamSchemeSettings from './permission_team_scheme_settings';
+import Permissions from 'mattermost-redux/constants/permissions';
+
+import PermissionTeamSchemeSettings from 'components/admin_console/permission_schemes_settings/permission_team_scheme_settings/permission_team_scheme_settings';
 
 function getAnyInstance(wrapper: any) {
     return wrapper.instance() as any;
@@ -429,5 +431,26 @@ describe('components/admin_console/permission_schemes_settings/permission_team_s
             expect(getAnyInstance(wrapper).getStateRoles()).toMatchSnapshot();
             done();
         });
+    });
+
+    test('should set moderated permissions on team/channel admins', () => {
+        const wrapper = shallow(
+            <PermissionTeamSchemeSettings {...defaultProps}/>,
+        );
+        const instance = getAnyInstance(wrapper);
+
+        // A moderated permission should set team/channel admins
+        instance.togglePermission('all_users', [Permissions.CREATE_POST]);
+        expect(getAnyState(wrapper).roles.all_users.permissions.indexOf(Permissions.CREATE_POST)).toBeGreaterThan(-1);
+        expect(getAnyState(wrapper).roles.channel_admin.permissions.indexOf(Permissions.CREATE_POST)).toBeGreaterThan(-1);
+        expect(getAnyState(wrapper).roles.team_admin.permissions.indexOf(Permissions.CREATE_POST)).toBeGreaterThan(-1);
+        expect(getAnyState(wrapper).roles.playbook_admin.permissions.indexOf(Permissions.CREATE_POST)).toEqual(-1);
+
+        // Changing a non-moderated permission should NOT set team/channel admins
+        instance.togglePermission('all_users', [Permissions.EDIT_OTHERS_POSTS]);
+        expect(getAnyState(wrapper).roles.all_users.permissions.indexOf(Permissions.EDIT_OTHERS_POSTS)).toBeGreaterThan(-1);
+        expect(getAnyState(wrapper).roles.channel_admin.permissions.indexOf(Permissions.EDIT_OTHERS_POSTS)).toEqual(-1);
+        expect(getAnyState(wrapper).roles.team_admin.permissions.indexOf(Permissions.EDIT_OTHERS_POSTS)).toEqual(-1);
+        expect(getAnyState(wrapper).roles.playbook_admin.permissions.indexOf(Permissions.EDIT_OTHERS_POSTS)).toEqual(-1);
     });
 });
