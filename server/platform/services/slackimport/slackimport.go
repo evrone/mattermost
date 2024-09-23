@@ -26,14 +26,25 @@ import (
 	"github.com/mattermost/mattermost/server/v8/channels/utils"
 )
 
+type slackPin struct {
+	Id      string `json:"id"`
+	Type    string `json:"type"`
+	Created int    `json:"created"`
+	User    string `json:"user"`
+	Owner   string `json:"owner"`
+}
+
 type slackChannel struct {
-	Id      string          `json:"id"`
-	Name    string          `json:"name"`
-	Creator string          `json:"creator"`
-	Members []string        `json:"members"`
-	Purpose slackChannelSub `json:"purpose"`
-	Topic   slackChannelSub `json:"topic"`
-	Type    model.ChannelType
+	Id         string          `json:"id"`
+	Name       string          `json:"name"`
+	CreatedAt  int64           `json:"created"`
+	Creator    string          `json:"creator"`
+	IsArchived bool            `json:"is_archived"`
+	Pins       []slackPin      `json:"pins"`
+	Members    []string        `json:"members"`
+	Purpose    slackChannelSub `json:"purpose"`
+	Topic      slackChannelSub `json:"topic"`
+	Type       model.ChannelType
 }
 
 type slackChannelSub struct {
@@ -47,9 +58,11 @@ type slackProfile struct {
 }
 
 type slackUser struct {
-	Id       string       `json:"id"`
-	Username string       `json:"name"`
-	Profile  slackProfile `json:"profile"`
+	Id        string       `json:"id"`
+	Username  string       `json:"name"`
+	Deleted   bool         `json:"deleted"`
+	UpdatedAt int64        `json:"updated"`
+	Profile   slackProfile `json:"profile"`
 }
 
 type slackFile struct {
@@ -229,6 +242,7 @@ func truncateRunes(s string, i int) string {
 }
 
 func (si *SlackImporter) slackAddUsers(rctx request.CTX, teamId string, slackusers []slackUser, importerLog *bytes.Buffer) map[string]*model.User {
+	now := time.Now()
 	// Log header
 	importerLog.WriteString(i18n.T("api.slackimport.slack_add_users.created"))
 	importerLog.WriteString("===============\r\n\r\n")
@@ -272,6 +286,11 @@ func (si *SlackImporter) slackAddUsers(rctx request.CTX, teamId string, slackuse
 			LastName:  lastName,
 			Email:     email,
 			Password:  password,
+			CreateAt:  now.AddDate(0, 0, -1).UnixMilli(),
+			UpdateAt:  now.UnixMilli(),
+		}
+		if sUser.Deleted {
+			newUser.DeleteAt = now.UnixMilli()
 		}
 
 		mUser := si.oldImportUser(rctx, team, &newUser)
@@ -315,12 +334,24 @@ func (si *SlackImporter) slackAddBotUser(rctx request.CTX, teamId string, log *b
 	return mUser
 }
 
-func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel *model.Channel, posts []slackPost, users map[string]*model.User, uploads map[string]*zip.File, botUser *model.User) {
+func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel *model.Channel, posts []slackPost, pins []slackPin, users map[string]*model.User, uploads map[string]*zip.File, botUser *model.User) {
 	sort.Slice(posts, func(i, j int) bool {
 		return slackConvertTimeStamp(posts[i].TimeStamp) < slackConvertTimeStamp(posts[j].TimeStamp)
 	})
 	threads := make(map[string]string)
 	for _, sPost := range posts {
+		newPost := model.Post{
+			ChannelId: channel.Id,
+			CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
+		}
+
+		for _, pin := range pins {
+			if sPost.TimeStamp == pin.Id {
+				newPost.IsPinned = true
+				break
+			}
+		}
+
 		switch {
 		case sPost.Type == "message" && (sPost.SubType == "" || sPost.SubType == "file_share"):
 			if sPost.User == "" {
@@ -331,12 +362,9 @@ func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel 
 				rctx.Logger().Debug("Slack Import: Unable to add the message as the Slack user does not exist in Mattermost.", mlog.String("user", sPost.User))
 				continue
 			}
-			newPost := model.Post{
-				UserId:    users[sPost.User].Id,
-				ChannelId: channel.Id,
-				Message:   sPost.Text,
-				CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
-			}
+
+			newPost.UserId = users[sPost.User].Id
+			newPost.Message = sPost.Text
 			if sPost.Upload {
 				if sPost.File != nil {
 					if fileInfo, ok := si.slackUploadFile(rctx, sPost.File, uploads, teamId, newPost.ChannelId, newPost.UserId, sPost.TimeStamp); ok {
@@ -372,12 +400,9 @@ func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel 
 				rctx.Logger().Debug("Slack Import: Unable to add the message as the Slack user does not exist in Mattermost.", mlog.String("user", sPost.User))
 				continue
 			}
-			newPost := model.Post{
-				UserId:    users[sPost.Comment.User].Id,
-				ChannelId: channel.Id,
-				Message:   sPost.Comment.Comment,
-				CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
-			}
+
+			newPost.UserId = users[sPost.Comment.User].Id
+			newPost.Message = sPost.Comment.Comment
 			si.oldImportPost(rctx, &newPost)
 		case sPost.Type == "message" && sPost.SubType == "bot_message":
 			if botUser == nil {
@@ -395,15 +420,10 @@ func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel 
 				props["attachments"] = sPost.Attachments
 			}
 
-			post := &model.Post{
-				UserId:    botUser.Id,
-				ChannelId: channel.Id,
-				CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
-				Message:   sPost.Text,
-				Type:      model.PostTypeSlackAttachment,
-			}
-
-			postId := si.oldImportIncomingWebhookPost(rctx, post, props)
+			newPost.UserId = botUser.Id
+			newPost.Message = sPost.Text
+			newPost.Type = model.PostTypeSlackAttachment
+			postId := si.oldImportIncomingWebhookPost(rctx, &newPost, props)
 			// If post is thread starter
 			if sPost.ThreadTS == sPost.TimeStamp {
 				threads[sPost.ThreadTS] = postId
@@ -425,15 +445,11 @@ func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel 
 				postType = model.PostTypeLeaveChannel
 			}
 
-			newPost := model.Post{
-				UserId:    users[sPost.User].Id,
-				ChannelId: channel.Id,
-				Message:   sPost.Text,
-				CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
-				Type:      postType,
-				Props: model.StringInterface{
-					"username": users[sPost.User].Username,
-				},
+			newPost.UserId = users[sPost.User].Id
+			newPost.Message = sPost.Text
+			newPost.Type = postType
+			newPost.Props = model.StringInterface{
+				"username": users[sPost.User].Username,
 			}
 			si.oldImportPost(rctx, &newPost)
 		case sPost.Type == "message" && sPost.SubType == "me_message":
@@ -445,12 +461,9 @@ func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel 
 				rctx.Logger().Debug("Slack Import: Unable to add the message as the Slack user does not exist in Mattermost.", mlog.String("user", sPost.User))
 				continue
 			}
-			newPost := model.Post{
-				UserId:    users[sPost.User].Id,
-				ChannelId: channel.Id,
-				Message:   "*" + sPost.Text + "*",
-				CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
-			}
+
+			newPost.UserId = users[sPost.User].Id
+			newPost.Message = "*" + sPost.Text + "*"
 			postId := si.oldImportPost(rctx, &newPost)
 			// If post is thread starter
 			if sPost.ThreadTS == sPost.TimeStamp {
@@ -465,13 +478,10 @@ func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel 
 				rctx.Logger().Debug("Slack Import: Unable to add the message as the Slack user does not exist in Mattermost.", mlog.String("user", sPost.User))
 				continue
 			}
-			newPost := model.Post{
-				UserId:    users[sPost.User].Id,
-				ChannelId: channel.Id,
-				Message:   sPost.Text,
-				CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
-				Type:      model.PostTypeHeaderChange,
-			}
+
+			newPost.UserId = users[sPost.User].Id
+			newPost.Message = sPost.Text
+			newPost.Type = model.PostTypeHeaderChange
 			si.oldImportPost(rctx, &newPost)
 		case sPost.Type == "message" && sPost.SubType == "channel_purpose":
 			if sPost.User == "" {
@@ -482,13 +492,10 @@ func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel 
 				rctx.Logger().Debug("Slack Import: Unable to add the message as the Slack user does not exist in Mattermost.", mlog.String("user", sPost.User))
 				continue
 			}
-			newPost := model.Post{
-				UserId:    users[sPost.User].Id,
-				ChannelId: channel.Id,
-				Message:   sPost.Text,
-				CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
-				Type:      model.PostTypePurposeChange,
-			}
+
+			newPost.UserId = users[sPost.User].Id
+			newPost.Message = sPost.Text
+			newPost.Type = model.PostTypePurposeChange
 			si.oldImportPost(rctx, &newPost)
 		case sPost.Type == "message" && sPost.SubType == "channel_name":
 			if sPost.User == "" {
@@ -499,14 +506,13 @@ func (si *SlackImporter) slackAddPosts(rctx request.CTX, teamId string, channel 
 				rctx.Logger().Debug("Slack Import: Unable to add the message as the Slack user does not exist in Mattermost.", mlog.String("user", sPost.User))
 				continue
 			}
-			newPost := model.Post{
-				UserId:    users[sPost.User].Id,
-				ChannelId: channel.Id,
-				Message:   sPost.Text,
-				CreateAt:  slackConvertTimeStamp(sPost.TimeStamp),
-				Type:      model.PostTypeDisplaynameChange,
-			}
+
+			newPost.UserId = users[sPost.User].Id
+			newPost.Message = sPost.Text
+			newPost.Type = model.PostTypeDisplaynameChange
 			si.oldImportPost(rctx, &newPost)
+		case sPost.Type == "message" && sPost.SubType == "pinned_item":
+			// skip
 		default:
 			rctx.Logger().Warn(
 				"Slack Import: Unable to import the message as its type is not supported",
@@ -595,12 +601,16 @@ func (si *SlackImporter) slackAddChannels(rctx request.CTX, teamId string, slack
 	addedChannels := make(map[string]*model.Channel)
 	for _, sChannel := range slackchannels {
 		newChannel := model.Channel{
+			CreateAt:    sChannel.CreatedAt * 1000,
 			TeamId:      teamId,
 			Type:        sChannel.Type,
 			DisplayName: sChannel.Name,
 			Name:        slackConvertChannelName(sChannel.Name, sChannel.Id),
 			Purpose:     sChannel.Purpose.Value,
 			Header:      sChannel.Topic.Value,
+		}
+		if sChannel.IsArchived {
+			newChannel.DeleteAt = time.Now().UnixMilli()
 		}
 
 		// Direct message channels in Slack don't have a name so we set the id as name or else the messages won't get imported.
@@ -637,7 +647,7 @@ func (si *SlackImporter) slackAddChannels(rctx request.CTX, teamId string, slack
 		}
 		importerLog.WriteString(newChannel.DisplayName + "\r\n")
 		addedChannels[sChannel.Id] = mChannel
-		si.slackAddPosts(rctx, teamId, mChannel, posts[sChannel.Name], users, uploads, botUser)
+		si.slackAddPosts(rctx, teamId, mChannel, posts[sChannel.Name], sChannel.Pins, users, uploads, botUser)
 	}
 
 	return addedChannels
